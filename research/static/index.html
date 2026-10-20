@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EUV Research Atlas</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="mark">EUV</span><div><strong>Research Atlas</strong><span class="subtitle">Discover the ideas behind the machines.</span></div></div>
+    <div class="local"><span class="dot"></span> Local only <span class="divider">/</span> Cosmos DB</div>
+  </header>
+  <main>
+    <section class="intro">
+      <div class="eyebrow">RESEARCH, WITHOUT BORDERS</div>
+      <h1>Follow an idea across the world.</h1>
+      <p>Explore the research behind extreme ultraviolet lithography, from early imaging experiments to ASML's industrial systems. Search by meaning. Inspect the evidence.</p>
+      <div id="stats" class="stats" aria-live="polite">Connecting to the local research collection...</div>
+    </section>
+    <nav aria-label="Views">
+      <button id="search-tab" class="tab active" aria-selected="true">Discover research</button>
+      <button id="lineage-tab" class="tab" aria-selected="false">Explore the lineage</button>
+    </nav>
+    <section id="discover">
+      <form id="search-form">
+        <label for="query" class="sr-only">Research topic or question</label>
+        <div class="searchbar"><input id="query" name="q" maxlength="600" required value="How did early Japanese and US research enable EUV lithography?" placeholder="Describe a research topic or ask a question..."><button type="submit" id="search-button">Find research <span aria-hidden="true">&rarr;</span></button></div>
+        <div class="examples"><span>Try a topic</span><button type="button" data-query="Early Japanese soft X-ray imaging using multilayer mirrors">Japanese origins</button><button type="button" data-query="US national laboratories and EUV lithography engineering test systems">US laboratory research</button><button type="button" data-query="ASML EUCLIDES European EUV lithography program">ASML &amp; EUCLIDES</button><button type="button" data-query="Tin plasma light sources for EUV lithography">Light sources</button></div>
+        <div class="workspace">
+          <aside>
+            <div class="filter-heading"><h2>Refine discovery</h2><button type="button" id="reset-filters">Clear</button></div>
+            <p class="muted small">Countries are paper affiliations, not nationalities. Multiple choices use OR; different filters use AND.</p>
+            <div id="filters"></div>
+            <fieldset><legend>Publication year</legend><div class="years"><input type="number" name="year_from" min="1980" max="2100" placeholder="From" aria-label="From publication year"><span>&ndash;</span><input type="number" name="year_to" min="1980" max="2100" placeholder="To" aria-label="To publication year"></div></fieldset>
+            <button type="submit" class="apply">Apply filters</button>
+          </aside>
+          <section class="results-area" aria-label="Search results">
+            <div id="result-heading" class="result-heading"><h2>Start with a question</h2></div>
+            <div id="notice" role="status" aria-live="polite"></div>
+            <div id="results"><div class="empty"><h3>Research connections start here.</h3><p>Search to retrieve real passages from the locally indexed collection. No generated answers, no external inference.</p></div></div>
+          </section>
+        </div>
+      </form>
+    </section>
+    <section id="lineage" hidden>
+      <div class="lineage-heading"><div class="eyebrow">A DOCUMENTED, INCOMPLETE HISTORY</div><h2>From research to industrialization</h2><p>Chronology provides context. Citations record references. Neither alone proves a transfer of ideas.</p></div>
+      <div class="legend"><span class="badge historical">Curated history</span><span class="badge citation">Recorded citation</span><span class="badge related">Semantic relation &ne; influence</span></div>
+      <p id="history-note" class="callout"></p>
+      <div id="timeline" class="timeline"></div>
+      <h2>Paper-to-paper citations in this collection</h2>
+      <p class="muted">Arrows point from a citing paper to the work it references. Open a paper to inspect passages, source records, and related research.</p>
+      <div id="citation-list" class="citation-list"></div>
+    </section>
+  </main>
+  <footer>Actual Cosmos DB vector retrieval &middot; Local 384-dimensional embeddings &middot; English-language discovery<br>Coverage is partial. Affiliation and citation metadata can be incomplete. Similarity is not evidence of historical influence.</footer>
+  <dialog id="paper-dialog"><div class="dialog-top"><span class="eyebrow">SOURCE NOTEBOOK</span><button id="close-paper" aria-label="Close paper details">Close &times;</button></div><div id="paper-content"></div></dialog>
+</body>
+</html>
