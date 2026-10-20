@@ -1,8 +1,11 @@
+import logging
 import time
 from dataclasses import dataclass, field as dc_field
 
-from research.db import connect, query
-from research.embed import MODEL_VERSION, embed
+from research.db import STORAGE_VERSION, RequestMetrics, connect, query, read_optional
+from research.embed import CHUNK_VERSION, MODEL_VERSION, embed
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,15 +46,14 @@ def filter_clause(filters):
 
 
 def public(item):
-    return {key: value for key, value in item.items() if not key.startswith("_")}
+    return {key: value for key, value in item.items() if not key.startswith("_") and key != "sync_hash"}
 
 
 def papers():
     return [public(p) for p in query(connect().get_container_client("papers"), "SELECT * FROM c")]
 
 
-def options():
-    records = papers()
+def build_options(records):
     countries, fields, institutions, authors = {}, {}, {}, {}
     for paper in records:
         for key, target in (("countries", countries), ("fields", fields)):
@@ -70,15 +72,30 @@ def options():
     }
 
 
+def require_ingestion():
+    state = read_optional(connect().get_container_client("settings"), "ingestion-state")
+    if not state or state["status"] != "complete":
+        raise RuntimeError("Research ingestion is missing or incomplete. Finish: python -m research ingest")
+    report = state["report"]
+    if report["model_version"] != MODEL_VERSION or report.get("chunk_version") != CHUNK_VERSION:
+        raise RuntimeError("Stored embeddings do not match the local model/chunk version")
+    if report.get("storage_version") != STORAGE_VERSION:
+        raise RuntimeError("Stored Cosmos schema is incompatible; use the documented storage migration")
+    return state
+
+
+def options():
+    state = require_ingestion()
+    stored = read_optional(connect().get_container_client("settings"), "filter-options")
+    if not stored or stored["ingested_at"] != state["report"]["ingested_at"]:
+        raise RuntimeError("Corpus filter options are missing or incomplete. Run: python -m research ingest")
+    return stored["options"]
+
+
 def search_vector(vector, filters=None, limit=10, exclude_paper=None):
     if not 1 <= limit <= 30:
         raise ValueError("Result limit must be between 1 and 30")
-    settings = connect().get_container_client("settings")
-    state = query(settings, "SELECT * FROM c WHERE c.id = 'ingestion-state'")
-    if not state or state[0]["status"] != "complete":
-        raise RuntimeError("Research ingestion is missing or incomplete. Finish: python -m research ingest")
-    if state[0]["report"]["model_version"] != MODEL_VERSION:
-        raise RuntimeError("Stored embeddings do not match the local model version")
+    state = require_ingestion()
     filters = filters or Filters()
     clauses, parameters = filter_clause(filters)
     clauses.append("c.model_version = @model")
@@ -87,29 +104,68 @@ def search_vector(vector, filters=None, limit=10, exclude_paper=None):
         clauses.append("c.paper_id != @exclude")
         parameters.append({"name": "@exclude", "value": exclude_paper})
     where = " WHERE " + " AND ".join(clauses)
-    projection = "c.id, c.paper_id, c.text, c.title, c.year, c.countries, c.page, c.section, c.source_url, c.coverage"
     container = connect().get_container_client("passages")
-    candidate_limit = min(2500, max(40, limit * 8))
+    cap = state["report"]["passages"]
+    candidate_limit = min(cap, max(40, limit * 8))
+    if candidate_limit < 1:
+        raise RuntimeError("Completed ingestion contains no searchable passages")
+    metrics = RequestMetrics()
+    attempts, total_candidates, hydration_queries = 0, 0, 0
+    fields = ("id", "paper_id", "text", "title", "year", "countries", "page", "section", "source_url", "coverage")
+    start = time.perf_counter()
     while True:
+        include_evidence = attempts == 0
+        projection = ", ".join(f"c.{key}" for key in fields) if include_evidence else "c.id, c.paper_id"
         rows = query(
             container,
             f"SELECT TOP {candidate_limit} {projection}, VectorDistance(c.embedding, @vector) AS score FROM c"
             + where + " ORDER BY VectorDistance(c.embedding, @vector)",
-            parameters,
+            parameters, metrics=metrics,
         )
+        attempts += 1
+        total_candidates += len(rows)
         groups = {}
         for row in rows:
-            if row["paper_id"] not in groups:
-                groups[row["paper_id"]] = {
-                    "id": row["paper_id"], "title": row["title"], "year": row["year"],
-                    "countries": row["countries"], "coverage": row["coverage"],
-                    "score": row["score"], "passages": [],
-                }
-            if len(groups[row["paper_id"]]["passages"]) < 2:
-                groups[row["paper_id"]]["passages"].append(row)
-        if len(groups) >= limit or len(rows) < candidate_limit or candidate_limit == 2500:
-            return list(groups.values())[:limit], len(rows)
-        candidate_limit = min(2500, candidate_limit * 3)
+            group = groups.setdefault(row["paper_id"], [])
+            if len(group) < 2:
+                group.append(row)
+        if len(groups) >= limit or len(rows) < candidate_limit or candidate_limit == cap:
+            break
+        candidate_limit = min(cap, candidate_limit * 3)
+    results = []
+    for paper_id, candidates in list(groups.items())[:limit]:
+        if include_evidence:
+            documents = {item["id"]: item for item in candidates}
+        else:
+            id_parameters = [{"name": f"@id{i}", "value": c["id"]} for i, c in enumerate(candidates)]
+            selected = query(
+                container,
+                "SELECT " + ", ".join(f"c.{key}" for key in fields)
+                + " FROM c WHERE c.paper_id = @paper AND c.id IN ("
+                + ", ".join(p["name"] for p in id_parameters) + ")",
+                [{"name": "@paper", "value": paper_id}, *id_parameters],
+                partition_key=paper_id, metrics=metrics,
+            )
+            hydration_queries += 1
+            documents = {item["id"]: item for item in selected}
+            if len(documents) != len(candidates) or any(c["id"] not in documents for c in candidates):
+                raise RuntimeError("Research passages changed during retrieval. Wait for ingestion to complete")
+        passages = []
+        for candidate in candidates:
+            item = documents[candidate["id"]]
+            passages.append({**{key: item[key] for key in fields}, "score": candidate["score"]})
+        first = passages[0]
+        results.append({
+            "id": paper_id, "title": first["title"], "year": first["year"],
+            "countries": first["countries"], "coverage": first["coverage"],
+            "score": first["score"], "passages": passages,
+        })
+    log.info(
+        "Cosmos vector search attempts=%d total_candidates=%d final_candidates=%d hydrated=%d hydration_queries=%d elapsed_ms=%.1f metrics=%s",
+        attempts, total_candidates, len(rows), sum(len(r["passages"]) for r in results),
+        hydration_queries, (time.perf_counter() - start) * 1000, metrics.summary(),
+    )
+    return results, len(rows)
 
 
 def search(text, filters=None, limit=10):

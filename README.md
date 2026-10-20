@@ -127,9 +127,16 @@ docker compose run --rm app python -m research ingest
 docker compose up -d
 ```
 
-Ingestion is single-writer, restartable, and idempotent. It removes stale passages
-and records after upserting the desired corpus. Searches refuse incomplete or
-incompatible ingestion state rather than mixing model versions. Recollection
+Ingestion is single-writer, restartable, and idempotent. It reconciles a paged
+projection of document identities and synchronization hashes, upserts only changed
+documents, and removes stale records. An unchanged repeat run performs no corpus
+document writes. This intentionally retains an O(N) identity reconciliation to
+detect missing or stale document identities without trusting a potentially stale
+local manifest. Synchronization hashes are application-owned; manual payload
+changes that leave a hash unchanged are not detected.
+Source PDF `content_hash` values are preserved separately from internal
+`sync_hash` values. Searches refuse incomplete or incompatible ingestion state
+rather than mixing model versions. Recollection
 uses the cached source responses; changing seed queries produces new requests.
 Upstream search results can change, so retain the local manifest and raw cache
 when reproducing a specific collection.
@@ -206,8 +213,40 @@ pretend full-text/hybrid search service.
   are excluded from normal scalar indexing. Filters are applied inside Cosmos,
   before nearest-neighbor selection. Results are grouped and progressively
   over-fetched to avoid one long paper filling the result list.
-- Research records use `/id`; citation/history edges use `/kind`. A settings
-  container records model/chunking configuration and ingestion completion.
+- Research records and settings use `/id`. Citation/history edges use `/from_id`;
+  an `incoming-edges` container uses `/to_id` and mirrors only citations to papers
+  in the corpus. Paper connections query outgoing and incoming adjacency within
+  their respective partitions, deduplicating self-citations. Both views are
+  reconciled before ingestion is marked complete.
+- Known settings documents use point reads, and paper-scoped passage queries
+  explicitly supply the partition key. Cross-paper semantic search remains
+  intentionally cross-partition.
+- The first bounded vector query includes projected evidence, avoiding additional
+  queries on the normal small-corpus path. If paper diversity requires progressive
+  over-fetching, expanded queries return only passage ID, paper ID, and score;
+  selected evidence is then hydrated with partition-scoped projections (at most
+  two passages per returned paper). These avoid transferring stored embedding
+  arrays. Over-fetching is bounded by the published passage count and logs total
+  candidates across all attempts plus evidence-query counts. The expanded path
+  trades additional scoped queries for smaller payloads; benchmark total RU and
+  latency on Azure before claiming a cloud cost improvement.
+- Scalar indexing excludes return-only payloads such as passage text, titles,
+  source URLs, embedding elements, and synchronization hashes, while retaining
+  filter fields. The emulator requires the include-all root policy; selective
+  include-only paths were rejected by its index engine. Explicit exclusions are
+  therefore used rather than a cloud-only include-only policy.
+- A settings container records model/chunk/storage versions, materialized filter
+  options, published corpus counts, and ingestion completion. Filter options are
+  generation-checked against the completed ingestion. Status/health checks read
+  the settings document instead of counting containers. Use
+  `/api/status?live_counts=true` for on-demand database counts; `counts_source`
+  distinguishes live counts from completed-ingestion counts. Out-of-band database
+  edits require re-ingestion to refresh materialized metadata.
+- Query logs include elapsed time and accumulated response charges across pages;
+  vector-search logs include all over-fetch attempts and evidence queries. SDK
+  throttle retry counts and wait time are recorded when available. Missing RU
+  headers are reported as unknown, not zero. The SDK retains its built-in bounded,
+  retry-after-aware throttling policy; ingestion writes remain serial.
 - Windows contain at most 200 content tokens with 32-token overlap and a title
   prefix of at most 40 tokens. Actual model tokenization is checked against its
   256-token limit; input is not silently truncated.
@@ -220,7 +259,37 @@ pretend full-text/hybrid search service.
   throughput, production recall, or cloud/emulator performance parity.
 - Range/composite index optimization and policy updates are limited in the emulator.
   Recreate the database for schema/model changes rather than relying on a
-  successful but potentially no-op collection update.
+  successful but potentially no-op collection update. Initialization reads back
+  every container's partition and scalar/vector index definitions and rejects
+  mismatches; `create_container_if_not_exists` does not migrate existing policies.
+
+### Storage migration without recollecting
+
+The `/kind` edge layout from the initial prototype is incompatible with storage
+version 2. Preserve the old database volume and use a separate Compose project
+to migrate safely. Stop the previous project's services first (without `down -v`),
+copy its ignored `.local/` directory into this worktree if needed, and verify that
+`corpus.json`, `embedding-cache.json`, PDFs, and `models/minilm/` are present.
+Do **not** run `collect` for a baseline-preserving migration.
+
+The following uses the cached corpus and model on an internal network, with a
+separate database volume named `euv-research-kit_cosmos-data`:
+
+```sh
+docker compose -p euv-research-kit -f compose.yaml -f compose.offline.yaml build app
+docker compose -p euv-research-kit -f compose.yaml -f compose.offline.yaml up -d cosmos
+docker compose -p euv-research-kit -f compose.yaml -f compose.offline.yaml run --rm app python -m research probe
+docker compose -p euv-research-kit -f compose.yaml -f compose.offline.yaml run --rm \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 app python -m research ingest
+docker compose -p euv-research-kit -f compose.yaml -f compose.offline.yaml up -d
+```
+
+Retain the same `-p` and `-f` arguments for subsequent commands against this stack.
+The app is still available at **http://localhost:8000**. With a complete baseline
+embedding cache, ingestion reports zero new embeddings; PDFs and model files are
+neither fetched nor modified. Model or cache omissions must be resolved from the
+baseline, not by recollecting data. Application image dependencies may need a
+networked build when their Docker layers are not already cached.
 
 References: [emulator feature support](https://learn.microsoft.com/en-us/azure/cosmos-db/emulator-linux),
 [vector policy and indexing](https://learn.microsoft.com/en-us/azure/cosmos-db/vector-search).
@@ -280,7 +349,7 @@ FastAPI serves the UI and structured endpoints:
 | `GET /api/papers/{id}` | Metadata and indexed passages with page/source provenance |
 | `GET /api/papers/{id}/connections` | Recorded citations and separately labeled semantic neighbors |
 | `GET /api/lineage` | Attributed milestones, historical connections, and in-corpus citations |
-| `GET /api/status` | Actual database counts, readiness, and corpus reports |
+| `GET /api/status` | Published ingestion counts, readiness, and corpus reports; `?live_counts=true` requests current database counts |
 
 Stable paper/passage IDs, source URLs, page references, and structured retrieval
 results are the integration boundary for a future local grounded-answer layer.

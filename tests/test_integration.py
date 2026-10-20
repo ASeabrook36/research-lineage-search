@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 from azure.cosmos.exceptions import CosmosHttpResponseError
 
-from research.db import connect, probe, query
+from research.db import CONTAINERS, VECTOR_POLICY, connect, probe, query, read_item, validate_container
 from research.embed import embed, model
-from research.search import Filters, filter_clause, papers, search, search_vector
+from research.search import Filters, build_options, filter_clause, options, papers, public, search, search_vector
 from research.ingest import sync_items
 
 pytestmark = [
@@ -121,13 +121,71 @@ def test_idempotent_sync_removes_stale_items_in_real_cosmos():
     try:
         sync_items(container, [{"id": "old", "paper_id": "paper"}, {"id": "keep", "paper_id": "paper"}], "paper_id")
         desired = [{"id": "new", "paper_id": "paper"}, {"id": "keep", "paper_id": "paper", "updated": True}]
-        sync_items(container, desired, "paper_id")
-        sync_items(container, desired, "paper_id")
+        assert sync_items(container, desired, "paper_id") == {"upserted": 2, "deleted": 1, "unchanged": 0}
+        before = {row["id"]: row["_etag"] for row in query(container, "SELECT * FROM c")}
+        assert sync_items(container, desired, "paper_id") == {"upserted": 0, "deleted": 0, "unchanged": 2}
+        after = {row["id"]: row["_etag"] for row in query(container, "SELECT * FROM c")}
+        assert before == after
         rows = query(container, "SELECT c.id, c.updated FROM c")
         assert {row["id"] for row in rows} == {"new", "keep"}
         assert next(row for row in rows if row["id"] == "keep")["updated"] is True
     finally:
         db.delete_container("idempotency-probe")
+
+
+def test_persisted_policies_and_materialized_metadata():
+    from research.web import status
+    db = connect()
+    for name, (partition_field, policy) in CONTAINERS.items():
+        validate_container(
+            db.get_container_client(name), partition_field, policy,
+            VECTOR_POLICY if name == "passages" else None,
+        )
+    assert options() == build_options(papers())
+    cached = status()
+    live = status(live_counts=True)
+    assert cached["ready"] and live["ready"]
+    assert cached["counts"] == live["counts"]
+    assert cached["counts_source"] == "completed_ingestion"
+    assert live["counts_source"] == "live"
+
+
+def test_partitioned_citation_views_preserve_connections_and_lineage():
+    from research.web import connections, lineage
+    db = connect()
+    edges = query(db.get_container_client("edges"), "SELECT * FROM c")
+    incoming = query(db.get_container_client("incoming-edges"), "SELECT * FROM c")
+    expected_incoming = [edge for edge in edges if edge["kind"] == "citation" and edge["target_in_corpus"]]
+    assert {row["id"]: public(row) for row in incoming} == {row["id"]: public(row) for row in expected_incoming}
+    target = next(edge["to_id"] for edge in expected_incoming)
+    response = connections(target)
+    expected = [edge for edge in edges if edge["kind"] == "citation" and target in (edge["from_id"], edge["to_id"])]
+    assert {edge["id"] for edge in response["citations"]} == {edge["id"] for edge in expected}
+    assert all("sync_hash" not in edge for edge in response["citations"])
+    graph = lineage()
+    assert len(graph["citations"]) == len(expected_incoming)
+    assert len(graph["historical_edges"]) == 7
+    assert graph["external_citation_count"] == sum(
+        edge["kind"] == "citation" and not edge["target_in_corpus"] for edge in edges
+    )
+    paper = read_item(db.get_container_client("papers"), target, target)
+    assert paper["id"] == response["paper_id"]
+
+
+def test_sync_reconciles_all_continuation_pages_and_duplicate_ids_across_partitions():
+    from azure.cosmos import PartitionKey
+    db = connect()
+    container = db.create_container_if_not_exists("paging-probe", partition_key=PartitionKey("/paper_id"))
+    try:
+        desired = [{"id": str(i), "paper_id": str(i % 5), "value": i} for i in range(205)]
+        desired.append({"id": "0", "paper_id": "different", "value": 206})
+        assert sync_items(container, desired, "paper_id")["upserted"] == 206
+        assert sync_items(container, desired, "paper_id") == {"upserted": 0, "deleted": 0, "unchanged": 206}
+        changed = [{**desired[0], "value": -1}, *desired[101:]]
+        assert sync_items(container, changed, "paper_id") == {"upserted": 1, "deleted": 100, "unchanged": 105}
+        assert query(container, "SELECT VALUE COUNT(1) FROM c") == [106]
+    finally:
+        db.delete_container("paging-probe")
 
 
 @pytest.mark.skipif(os.environ.get("REQUIRE_OFFLINE") != "1", reason="Set REQUIRE_OFFLINE=1 with the internal-network override")
