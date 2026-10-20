@@ -1,0 +1,16 @@
+{
+  "queries": [
+    "extreme ultraviolet lithography",
+    "soft x ray projection lithography Kinoshita",
+    "EUV lithography multilayer mirrors",
+    "EUV lithography virtual national laboratory",
+    "EUCLIDES lithography",
+    "ASML EUV lithography development",
+    "EUV lithography laser produced tin plasma",
+    "EUV lithography Bijkerk"
+  ],
+  "target_records": 150,
+  "target_full_text": 30,
+  "max_full_text_attempts": 80,
+  "max_passages": 2500
+}

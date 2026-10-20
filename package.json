@@ -1,0 +1,10 @@
+{
+  "name": "euv-research-atlas-ui-checks",
+  "private": true,
+  "scripts": {
+    "test:ui": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1"
+  }
+}
